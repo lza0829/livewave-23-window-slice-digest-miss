@@ -5,7 +5,7 @@ from fastapi import HTTPException
 from app.db import 连接
 from app.seed import 此刻
 from app.services import 时间, 热度窗, 窗参 as 窗参服务
-from app.modules import 滑动窗切分
+from app.modules import 滑动窗切分, 窗键切片摘要
 
 
 def 装一批(体: dict) -> dict:
@@ -18,6 +18,8 @@ def 装一批(体: dict) -> dict:
     - 关闭后至 水位>=止+允许迟到 仍可迟到修正并发撤回
     - 旁路取事件窗键集「最旧一扇」的旁路界：越界则整事件原子旁路，不半截入窗
     - 整批与改窗参/排水互斥：一批事件全属同一窗代，不半截双套窗键
+    - 入窗归属与窗键切片摘要同票（事件编号/窗型参数快照/窗键集合/摘要哈希），
+      迟到修正撤回只吃摘要内窗键；半截失败整票回滚，禁止摘要空/摘要外挂/分叉提交
     """
     批次编号 = 体.get("批次编号") or f"批-{此刻().replace(':', '').replace('-', '')}"
     事件列表 = 体.get("事件") or []
@@ -128,6 +130,16 @@ def 装一批(体: dict) -> dict:
                     continue
 
                 
+                # 归属写闸：入窗归属与窗键切片摘要同票（事件编号/窗型参数快照/窗键集合/摘要哈希），
+                # 写失败即抛错整票回滚，禁止入窗成功摘要空。
+                摘要哈希 = 窗键切片摘要.尝试写切片(
+                    conn,
+                    事件编号=事件编号,
+                    窗型参数={"窗型": 窗参["窗型"], "窗长秒": 窗长, "滑动步长秒": 步长, "窗代": 窗代},
+                    窗键集合=键集,
+                    批号=批次编号,
+                    时刻=处理时,
+                )
                 for 起, wk in zip(窗起集, 键集):
                     if not conn.execute("SELECT 1 FROM 热度窗 WHERE 窗键=?", (wk,)).fetchone():
                         conn.execute(
@@ -150,6 +162,12 @@ def 装一批(体: dict) -> dict:
                 for wk in 键集:
                     窗 = conn.execute("SELECT * FROM 热度窗 WHERE 窗键=?", (wk,)).fetchone()
                     if 窗["状态"] == "已关闭":
+                        # 撤回簿吃摘要：迟到修正只能挂摘要内窗键，禁止按新公式挂摘要外窗
+                        if 窗键切片摘要.应拒摘要外挂(conn, 事件编号, wk):
+                            raise HTTPException(409, detail={
+                                "失败闭": True,
+                                "原因": f"撤回挂到摘要外窗键{wk}（事件{事件编号}摘要未含此键），整票回滚",
+                            })
                         旧赞, 旧送 = 窗["点赞合计"], 窗["送礼合计"]
                         新赞, 新送 = 旧赞 + 点赞, 旧送 + 送礼
                         新版本 = int(窗["版本"]) + 1
@@ -172,11 +190,20 @@ def 装一批(体: dict) -> dict:
                         "INSERT INTO 事件窗联(事件编号, 窗键) VALUES (?,?)",
                         (事件编号, wk),
                     )
-                try:
-                    from app.modules import 窗键切片摘要 as _切
-                    _切.尝试写切片(conn, 事件编号=事件编号, 窗键=wk)
-                except Exception:
-                    pass
+                # 提交闸：摘要与窗行键集分叉则整票回滚，不得分叉还提交
+                联集 = [
+                    r["窗键"]
+                    for r in conn.execute(
+                        "SELECT 窗键 FROM 事件窗联 WHERE 事件编号=?", (事件编号,)
+                    )
+                ]
+                if sorted(联集) != sorted(键集):
+                    raise HTTPException(409, detail={
+                        "失败闭": True,
+                        "原因": f"事件{事件编号}摘要与窗行键集分叉，整票回滚",
+                        "摘要键集": sorted(键集),
+                        "窗联键集": sorted(联集),
+                    })
                 报告["入窗"] += 1
                 报告["入流"] += 1
                 报告["撤回"] += 修正窗数
@@ -187,6 +214,7 @@ def 装一批(体: dict) -> dict:
                     "窗键集": 键集,
                     "窗数": len(键集),
                     "修正窗数": 修正窗数,
+                    "摘要哈希": 摘要哈希,
                 })
 
             for 房行 in conn.execute("SELECT 房间键, 事件时水位, 允许迟到秒 FROM 水位线"):

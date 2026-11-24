@@ -1,7 +1,9 @@
 from app.db import 连接
 from app.seed import 此刻
 from app.services import 时间
-from app.modules import 滑动窗切分
+from app.modules import 滑动窗切分, 窗键切片摘要
+
+import json
 
 
 def 跑贯验() -> dict:
@@ -12,6 +14,8 @@ def 跑贯验() -> dict:
     - 旁路事件不得挂窗键、不得有窗联行
     - 同一房不得同时有两代及以上开启窗（不得双套窗键并存关窗）
     - 每个已入窗事件的窗键集，须与其窗代窗参重算结果一致（防步长漂移/新旧混算）
+    - 窗键切片摘要互证：已入窗事件摘要非空、摘要↔窗行键集不分叉、哈希可核、
+      快照符窗参史、撤回单窗键全在触发事件摘要内（入窗摘要冻结，不回溯改挂）
     """
     conn = 连接()
     try:
@@ -101,8 +105,60 @@ def 跑贯验() -> dict:
         if 孤联:
             问题.append(f"窗联指向不存在的窗:{孤联}")
 
+        # —— 窗键切片摘要互证（归属写闸/撤回簿/关闭扫描/窗参页协同）——
+        摘要表 = {r["事件编号"]: r for r in conn.execute("SELECT * FROM 窗键切片摘要")}
+        for ev in conn.execute("SELECT 事件编号, 窗代, 命运 FROM 互动事件"):
+            d = 摘要表.get(ev["事件编号"])
+            if ev["命运"] != "已入窗":
+                if d:
+                    问题.append(f"事件{ev['事件编号']}命运{ev['命运']}却有窗键切片摘要")
+                continue
+            if not d:
+                问题.append(f"事件{ev['事件编号']}已入窗但窗键切片摘要缺失（入窗成功摘要空）")
+                continue
+            try:
+                集 = json.loads(d["窗键集合"])
+                参 = json.loads(d["窗型参数"])
+            except Exception:
+                问题.append(f"事件{ev['事件编号']}摘要字段不可解析")
+                continue
+            if not 集:
+                问题.append(f"事件{ev['事件编号']}摘要窗键集合为空（入窗成功摘要空）")
+            联 = [
+                r["窗键"]
+                for r in conn.execute(
+                    "SELECT 窗键 FROM 事件窗联 WHERE 事件编号=?", (ev["事件编号"],)
+                )
+            ]
+            if sorted(联) != sorted(集):
+                问题.append(
+                    f"事件{ev['事件编号']}摘要与窗行键集分叉: 摘要{sorted(集)} vs 窗联{sorted(联)}"
+                )
+            if 窗键切片摘要.计算哈希(ev["事件编号"], 参, 集) != d["摘要哈希"]:
+                问题.append(f"事件{ev['事件编号']}摘要哈希不符")
+            if 参.get("窗代") != ev["窗代"]:
+                问题.append(
+                    f"事件{ev['事件编号']}摘要窗代g{参.get('窗代')}与事件窗代g{ev['窗代']}分叉"
+                )
+            史参 = 史.get(参.get("窗代"))
+            if not 史参 or (史参["窗型"], 史参["窗长秒"], 史参["滑动步长秒"]) != (
+                参.get("窗型"), 参.get("窗长秒"), 参.get("滑动步长秒")
+            ):
+                问题.append(f"事件{ev['事件编号']}摘要窗型参数快照与窗参史不符")
+        for r in conn.execute("SELECT * FROM 撤回单"):
+            d = 摘要表.get(r["事件编号"])
+            if not d:
+                问题.append(f"撤回单#{r['编号']}触发事件{r['事件编号']}无摘要，撤回未吃摘要")
+                continue
+            try:
+                集 = json.loads(d["窗键集合"])
+            except Exception:
+                集 = []
+            if r["窗键"] not in 集:
+                问题.append(f"撤回单#{r['编号']}窗键{r['窗键']}挂在事件{r['事件编号']}摘要外")
+
         通过 = 1 if not 问题 else 0
-        说明 = "窗输出与事件/撤回互证通过（含窗键集重算、双代开启核查）" if 通过 else "；".join(问题)[:800]
+        说明 = "窗输出与事件/撤回/摘要互证通过（含窗键集重算、双代开启、摘要冻结核查）" if 通过 else "；".join(问题)[:800]
         conn.execute(
             """INSERT INTO 窗贯验(时刻,事件数,已关闭窗数,撤回数,旁路数,是否通过,说明)
                VALUES (?,?,?,?,?,?,?)""",

@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS 窗键切片摘要 (
   批号 TEXT NOT NULL DEFAULT '',
   时刻 TEXT NOT NULL DEFAULT ''
 );
+-- 入窗摘要冻结：一事件一摘要，钉死不可改挂
+CREATE UNIQUE INDEX IF NOT EXISTS 窗键切片摘要_事件编号_uq ON 窗键切片摘要(事件编号);
 
 CREATE TABLE IF NOT EXISTS 站规 (
   键 TEXT PRIMARY KEY,
